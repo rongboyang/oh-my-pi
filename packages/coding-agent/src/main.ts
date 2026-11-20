@@ -27,6 +27,7 @@ import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
+import { startRemoteRpcServer } from "./modes/rpc/remote-server";
 import {
 	type Args,
 	reportInvalidFlagValues,
@@ -208,7 +209,7 @@ import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<number>;
-type RunRpcMode = (session: AgentSession, options?: RpcModeOptions) => Promise<never>;
+type RunRpcMode = (session: AgentSession, options?: RpcModeOptions) => Promise<void>;
 
 /** Interactive-only graph boundary; login dialogs and overlays load on first real use. */
 async function loadInteractiveModeConstructor() {
@@ -1868,6 +1869,7 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	remoteName?: string;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
@@ -1941,7 +1943,7 @@ export async function runRootCommand(
 		if (!parsedArgs.help && !isBunTestRuntime()) syncRelayInstallsOnStartup();
 		const mode = parsedArgs.mode || "text";
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
-		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
+		const rpcInput = !deps.remoteName && (mode === "rpc" || mode === "rpc-ui") ? claimRpcInput() : undefined;
 
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
@@ -2911,13 +2913,27 @@ export async function runRootCommand(
 				}
 				stopStartupWatchdog();
 				logger.endTiming();
-				await runRpcMode(session, {
-					setToolUIContext: mode === "rpc-ui" ? setToolUIContext : undefined,
-					headless: parsedArgs.noUi === true,
-					subagentEventBus,
-					mcpManager,
-					input: rpcInput,
-				});
+				let remoteTransport:
+					| { input: ReadableStream<Uint8Array>; output(frame: object): void; close(): Promise<void> }
+					| undefined;
+				try {
+					remoteTransport = deps.remoteName ? await startRemoteRpcServer(deps.remoteName, session) : undefined;
+				} catch (error) {
+					await disposeSessionQuietly(session);
+					throw error;
+				}
+				try {
+					await runRpcMode(session, {
+						setToolUIContext: mode === "rpc-ui" ? setToolUIContext : undefined,
+						headless: parsedArgs.noUi === true,
+						subagentEventBus,
+						mcpManager,
+						input: remoteTransport?.input ?? rpcInput,
+						remoteTransport,
+					});
+				} finally {
+					await remoteTransport?.close();
+				}
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 

@@ -137,6 +137,7 @@ import {
 	validateRpcSettingValue,
 } from "./rpc-extensions";
 import { applyRpcImportForeignSession, buildRpcForeignSessionList } from "./rpc-foreign";
+import { REMOTE_MAX_FRAME_BYTES } from "./remote-wire";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { getRpcGitChanges, getRpcGitDiff } from "./rpc-git-diff";
 import { RpcGoalController } from "./rpc-goal";
@@ -1602,7 +1603,8 @@ function parseFormDialogResponse(
 		if (response.timedOut) dialogOptions.onTimeout?.();
 		return undefined;
 	}
-	const submitted: unknown = "data" in response ? response.data : "formData" in response ? response.formData : undefined;
+	const submitted: unknown =
+		"data" in response ? response.data : "formData" in response ? response.formData : undefined;
 	if (!isRecord(submitted)) throw new Error("Form dialog response must carry a data object");
 
 	// Reject names the form does not have; hidden inputs may be echoed but keep the form's own values.
@@ -1945,6 +1947,8 @@ export interface RpcModeOptions {
 	headless?: boolean;
 	subagentEventBus?: EventBus;
 	input?: ReadableStream<Uint8Array>;
+	/** Instance-owned transport; unlike stdio it remains open across peer disconnects. */
+	remoteTransport?: { output(frame: object): void; close(): Promise<void> };
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
 	/** Builds the native speech controller; tests may substitute the capture boundary. */
@@ -1957,12 +1961,13 @@ export interface RpcModeOptions {
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
+export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<void> {
 	const {
 		setToolUIContext,
 		headless = false,
 		subagentEventBus,
 		input = claimRpcInput(),
+		remoteTransport,
 		createLiveSession,
 		createDictationController,
 	} = options;
@@ -1973,23 +1978,31 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
 
-	const frameEncoder = new RpcFrameEncoder();
-	// Bun on Windows writes a piped process.stdout with a blocking WriteFile on the
-	// JS thread and never reports backpressure, so a client that stops reading
-	// stdout froze the whole worker, stdin reader included. An fd write stream
-	// writes from the threadpool and reports backpressure, letting the writer spool.
-	const stdout = process.platform === "win32" ? fs.createWriteStream("", { fd: 1, autoClose: false }) : process.stdout;
-	// The writer can fail before the bridge is constructed.
 	let dictationBridge: RpcDictationBridge | undefined = undefined;
-	const outputWriter = new RpcOutputWriter(stdout, failure => {
-		logger.error("RPC output delivery failed", { error: String(failure) });
-		dictationBridge?.dispose();
-		void session.dispose().finally(() => process.exit(1));
-	});
+	const frameEncoder = remoteTransport ? undefined : new RpcFrameEncoder();
+	// Remote frames wrap the RPC payload in an event/reply envelope. Reserve space for
+	// that envelope and its identifiers; stdio retains its negotiated encoder limit.
+	const maxIntactFrameBytes = () => frameEncoder?.maxIntactFrameBytes ?? REMOTE_MAX_FRAME_BYTES - 16 * 1024;
+	const stdout = remoteTransport
+		? undefined
+		: process.platform === "win32"
+			? fs.createWriteStream("", { fd: 1, autoClose: false })
+			: process.stdout;
+	const outputWriter =
+		stdout &&
+		new RpcOutputWriter(stdout, failure => {
+			logger.error("RPC output delivery failed", { error: String(failure) });
+			dictationBridge?.dispose();
+			void session.dispose().finally(() => process.exit(1));
+		});
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		outputWriter.write(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
-			frameEncoder.setProtocolVersion(2);
+		if (remoteTransport) {
+			remoteTransport.output(obj);
+		} else if (outputWriter && frameEncoder) {
+			outputWriter.write(frameEncoder.encodeFrames(obj));
+			if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
+				frameEncoder.setProtocolVersion(2);
+		}
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -2193,7 +2206,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				requestRpcFormDialog(
 					this.pendingRequests,
 					this.output,
-					frameEncoder.maxIntactFrameBytes,
+					maxIntactFrameBytes(),
 					html,
 					dialogOptions,
 					this.formDialogEnabled,
@@ -2394,6 +2407,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// A single shared instance routes all responses received on stdin to the
 	// correct waiting promise regardless of which code path created the request.
 	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
+	if (remoteTransport) {
+		rpcUiContext.askDialogEnabled = true;
+		rpcUiContext.formDialogEnabled = true;
+	}
 	setToolUIContext?.(rpcUiContext, true);
 	session.setPromptDropped(prompt => reportDroppedPrompt(output, prompt));
 	const collabController = new RpcCollabController({
@@ -2424,7 +2441,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	);
 
 	/** Dispose the session, drain protocol output, then end the process. */
-	const disposeAndExit = async (exitCode = 0): Promise<never> => {
+	const disposeAndExit = async (exitCode = 0): Promise<void> => {
 		try {
 			// The process ends regardless; report an unsaved side answer instead of skipping dispose.
 			await btw.close().catch(btwError => {
@@ -2446,7 +2463,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			browserHost.stop();
 		} catch (error) {
 			if (!persistenceFailure || error !== persistenceFailure) throw error;
-			await outputWriter.close();
+			await outputWriter?.close();
+			await remoteTransport?.close();
 			try {
 				if (!process.stderr.write(`${formatPersistenceDurabilityFailure(persistenceFailure.message)}\n`)) {
 					const { promise, resolve } = Promise.withResolvers<void>();
@@ -2464,10 +2482,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			} catch {
 				// A mirror that cannot be written must not strand process teardown.
 			}
+			if (remoteTransport) throw error;
 			process.exit(1);
 		}
-		await outputWriter.close();
-		process.exit(exitCode);
+		await outputWriter?.close();
+		await remoteTransport?.close();
+		if (exitCode !== 0 && remoteTransport) process.exitCode = exitCode;
+		if (!remoteTransport) process.exit(exitCode);
 	};
 
 	const initialize = async (): Promise<void> => {
@@ -2914,7 +2935,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				return fitRemoveQueuedMessageResponse(
 					id,
 					session.takeQueuedMessage(command.message, command.queue),
-					frameEncoder.maxIntactFrameBytes,
+					maxIntactFrameBytes(),
 				);
 			}
 
@@ -2944,7 +2965,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				goalController.stopForHostAbort();
 				abortBuiltinCommands("RPC command aborted by host");
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				return fitAbortAndRestoreQueueResponse(id, restored, frameEncoder.maxIntactFrameBytes);
+				return fitAbortAndRestoreQueueResponse(id, restored, maxIntactFrameBytes());
 			}
 
 			case "abort_and_prompt": {
@@ -5641,11 +5662,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	await shutdownCoordinator.drain();
 	subagentRegistry?.dispose();
 	await Promise.all([liveBridge.stop(), collabController.dispose()]);
-	// Dispose the main session before exiting so the browser reaper and other
-	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
-	// prior pi.shutdown() through the coordinator makes this await settle
-	// immediately. Returned rather than awaited: `runRpcMode` is typed
-	// `Promise<never>`, and only returning the `Promise<never>` keeps this end
-	// point unreachable for the compiler.
+	// The instance-owned input reaches EOF only when the server shuts down.
+	// Stdio still exits after disposing the session and draining its writer.
 	return disposeAndExit(startupFailure || inputFailure ? 1 : 0);
 }

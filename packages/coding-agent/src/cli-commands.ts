@@ -33,6 +33,11 @@ export const commands: CommandEntry[] = [
 		},
 	},
 	{
+		name: "remote",
+		load: () => import("./commands/remote").then(m => m.default),
+		help: { description: "Serve, discover, or attach to a remote workspace instance" },
+	},
+	{
 		name: "acp",
 		load: () => import("./commands/acp").then(m => m.default),
 		help: commandHelp.acpHelp,
