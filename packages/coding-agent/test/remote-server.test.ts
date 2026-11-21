@@ -103,7 +103,7 @@ interface Fixture {
 	server: RemoteRpcInstance;
 	state: { sessionId: string | null; messages: Record<string, unknown>[] };
 	reader: ReadableStreamDefaultReader<Uint8Array>;
-	hello: object;
+	hello: { workspace: string; id: string; capabilities: readonly string[] } & Record<string, unknown>;
 	epoch: () => string;
 	socketPath: string;
 	advance: (ms: number) => void;
@@ -922,4 +922,39 @@ describe("remote RPC instance", () => {
 		).toMatchObject({ phase: "running", epoch: fixture.epoch(), sessionId: "session-1" });
 		next.socket.destroy();
 	});
+
+	test.skipIf(process.platform !== "darwin")(
+		"document previews need negotiation and the current workspace view",
+		async () => {
+			const fixture = await serve();
+			await fs.writeFile(path.join(fixture.hello.workspace, "notes.md"), "# remote document\n");
+			const request = (id: string, path: string) => ({ type: "request", id, op: "read_document", data: { path } });
+			const older = await hello(fixture, "old-client");
+			expect((await older.ask("old-preview", request("old-preview", "notes.md"))).error).toEqual({
+				code: "unsupported",
+			});
+			older.socket.destroy();
+			const client = await connect(fixture.socketPath);
+			const negotiation = await client.ask("new-client", {
+				...fixture.hello,
+				id: "new-client",
+				capabilities: [...REMOTE_REQUIRED_CAPABILITIES, "read_document"],
+			});
+			expect(negotiation.data).toMatchObject({ capabilities: [...REMOTE_REQUIRED_CAPABILITIES, "read_document"] });
+			expect((await client.ask("early-preview", request("early-preview", "notes.md"))).error).toEqual({
+				code: "stale_session",
+			});
+			await client.ask("lease", { type: "request", id: "lease", op: "acquire", data: {} });
+			await client.ask("sync", { type: "request", id: "sync", op: "sync", data: { lease: 1 } });
+			expect((await client.ask("notes", request("notes", "notes.md"))).data).toMatchObject({
+				path: path.join(fixture.hello.workspace, "notes.md"),
+				content: "# remote document\n",
+				mediaType: "text/markdown",
+			});
+			expect((await client.ask("outside", request("outside", "/etc/hosts"))).error).toEqual({
+				code: "preview_outside_workspace",
+			});
+			client.socket.destroy();
+		},
+	);
 });

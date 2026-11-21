@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import type { AgentSession } from "../../session/agent-session";
+import { openRemoteDocumentWorkspace } from "./remote-document";
 import {
 	boundedHistoryItem,
 	boundedRemoteEvent,
@@ -36,6 +37,7 @@ interface Peer {
 	decoder: RemoteFrameDecoder;
 	limit: number;
 	hello: boolean;
+	documents?: boolean;
 	synced: boolean;
 	queuedFrames: number;
 	/** Id of the latest synchronous capture this peer may page with. */
@@ -111,9 +113,11 @@ export async function startRemoteRpcServer(
 	session: AgentSession,
 	options: RemoteServerOptions = {},
 ): Promise<RemoteRpcInstance> {
-	const workspace = await fs.realpath(session.sessionManager.getCwd());
-	const owner = await prepareRemoteRegistration(name, workspace);
+	const owner = await prepareRemoteRegistration(name, session.sessionManager.getCwd());
 	const { registration } = owner;
+	const { workspace } = registration;
+	const documents = openRemoteDocumentWorkspace(workspace);
+	if (documents) registration.capabilities = [...REMOTE_REQUIRED_CAPABILITIES, "read_document"];
 	const now = options.now ?? Date.now;
 	const ledger = new RemoteReceiptLedger({ now });
 	const catalog = options.sessions ?? createWorkspaceSessionCatalog(workspace);
@@ -305,12 +309,13 @@ export async function startRemoteRpcServer(
 			}
 			peer.limit = Math.min(frame.maxFrameBytes, REMOTE_MAX_FRAME_BYTES);
 			peer.hello = true;
+			peer.documents = documents !== null && frame.capabilities.includes("read_document");
 			reply(peer, frame.id, {
 				version: REMOTE_PROTOCOL_VERSION,
 				instanceKey: registration.instanceKey,
 				workspace,
 				epoch: registration.epoch,
-				capabilities: REMOTE_REQUIRED_CAPABILITIES,
+				capabilities: peer.documents ? registration.capabilities : REMOTE_REQUIRED_CAPABILITIES,
 				maxFrameBytes: peer.limit,
 			});
 			peer.decoder = new RemoteFrameDecoder(peer.limit);
@@ -439,6 +444,20 @@ export async function startRemoteRpcServer(
 					return;
 				}
 				replyCapped(peer, id, page);
+				return;
+			}
+			case "read_document": {
+				if (!peer.documents || !documents) {
+					fail(peer, id, "unsupported");
+					return;
+				}
+				if (!peer.view || !validView(peer, peer.view)) {
+					fail(peer, id, "stale_session");
+					return;
+				}
+				const result = documents.read(request.data.path, peer.limit);
+				if (result.ok) replyCapped(peer, id, result.data);
+				else fail(peer, id, result.code);
 				return;
 			}
 			case "sessions": {
@@ -656,6 +675,7 @@ export async function startRemoteRpcServer(
 		await owner.publish();
 	} catch (error) {
 		server.close();
+		documents?.close();
 		await owner.dispose();
 		throw error;
 	}
@@ -670,6 +690,7 @@ export async function startRemoteRpcServer(
 	function close(): Promise<void> {
 		if (closePromise) return closePromise;
 		closed = true;
+		documents?.close();
 		process.off("SIGINT", onInt);
 		process.off("SIGTERM", onTerm);
 		for (const peer of peers) peer.socket.destroy();
