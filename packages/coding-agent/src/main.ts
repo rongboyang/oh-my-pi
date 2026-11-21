@@ -27,7 +27,7 @@ import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
-import { startRemoteRpcServer } from "./modes/rpc/remote-server";
+import { type RemoteRpcInstance, startRemoteRpcServer } from "./modes/rpc/remote-server";
 import {
 	type Args,
 	reportInvalidFlagValues,
@@ -2913,9 +2913,7 @@ export async function runRootCommand(
 				}
 				stopStartupWatchdog();
 				logger.endTiming();
-				let remoteTransport:
-					| { input: ReadableStream<Uint8Array>; output(frame: object): void; close(): Promise<void> }
-					| undefined;
+				let remoteTransport: RemoteRpcInstance | undefined;
 				try {
 					remoteTransport = deps.remoteName ? await startRemoteRpcServer(deps.remoteName, session) : undefined;
 				} catch (error) {

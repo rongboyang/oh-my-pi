@@ -46,9 +46,11 @@ export default class Remote extends Command {
 					parsed.version ||
 					parsed.export ||
 					parsed.resume ||
+					parsed.restore ||
 					parsed.continue ||
 					parsed.fork ||
 					parsed.print ||
+					parsed.noSession ||
 					parsed.noUi
 				) {
 					process.stderr.write(`${usage}\n`);

@@ -1948,7 +1948,12 @@ export interface RpcModeOptions {
 	subagentEventBus?: EventBus;
 	input?: ReadableStream<Uint8Array>;
 	/** Instance-owned transport; unlike stdio it remains open across peer disconnects. */
-	remoteTransport?: { output(frame: object): void; close(): Promise<void> };
+	remoteTransport?: {
+		output(frame: object): void;
+		close(): Promise<void>;
+		/** False once a queued remote stop no longer matches the current run and session. */
+		mayAbort(commandId: string | undefined): boolean;
+	};
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
 	/** Builds the native speech controller; tests may substitute the capture boundary. */
@@ -2949,6 +2954,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "abort": {
+				// A queued remote stop can outlive its run between the transport's pre-delivery
+				// gate and this handler; the fence refuses it before any side effect can touch a
+				// run the client never asked to stop. Stdio has no transport and is unaffected.
+				if (remoteTransport && !remoteTransport.mayAbort(command.id))
+					return error(id, "abort", "Remote run no longer active", "stale_run");
 				// TUI Esc pauses the loop before aborting the current iteration.
 				loopModeController.pause();
 				goalController.stopForHostAbort();
