@@ -2,15 +2,23 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import type { AgentSession } from "../../session/agent-session";
+import {
+	boundedHistoryItem,
+	boundedRemoteEvent,
+	RemoteHistoryView,
+	type RemoteOutputIdResolver,
+} from "./remote-history-view";
 import { prepareRemoteRegistration } from "./remote-registration";
 import { RemoteReceiptLedger, type RemoteActionScope } from "./remote-receipts";
 import { createWorkspaceSessionCatalog, type RemoteSessionCatalog } from "./remote-sessions";
+import { RemoteToolOutputs, type RemoteToolOutputView } from "./remote-tool-outputs";
 import {
 	encodeRemoteFrame,
 	parseRemoteClientFrame,
 	RemoteFrameDecoder,
 	REMOTE_LEASE_TIMEOUT_MS,
 	REMOTE_MAX_FRAME_BYTES,
+	REMOTE_MAX_OUTPUT_PAGE_BYTES,
 	REMOTE_MAX_QUEUE_BYTES,
 	REMOTE_MAX_QUEUE_FRAMES,
 	REMOTE_PROTOCOL_VERSION,
@@ -30,6 +38,8 @@ interface Peer {
 	hello: boolean;
 	synced: boolean;
 	queuedFrames: number;
+	/** Id of the latest synchronous capture this peer may page with. */
+	view?: string;
 }
 
 /** One dispatched action awaiting Core's reply; the receipt, not a peer, owns it. */
@@ -48,6 +58,33 @@ interface InputEntry {
 	readonly scope?: RemoteActionScope;
 	readonly innerId?: string;
 }
+
+/**
+ * One synchronous capture, keyed by the archive's view id. Pages may only be
+ * read by the peer that received it, on the lease number and session it was
+ * bound to, so an old view can never cross into a newer sync, lease or session.
+ */
+interface SyncedView {
+	readonly id: string;
+	readonly owner: Peer;
+	readonly lease: number;
+	readonly sessionId: string | null;
+	/** Watermark in the sync reply: every delta sent afterwards carries `seq` strictly greater. */
+	readonly seq: number;
+	/** Transcript reference taken at sync; live appends never shift served pages. */
+	readonly history: RemoteHistoryView;
+	/** Detached tool-output capture pageable under `id`. */
+	readonly outputs: RemoteToolOutputView;
+}
+
+/** Page budget: output-page cap shrunk to the negotiated frame limit, with envelope slack. */
+const pageBudget = (peer: Peer): number => Math.max(1024, Math.min(REMOTE_MAX_OUTPUT_PAGE_BYTES, peer.limit) - 1024);
+
+/** An archive reference exists only for outputs this capture actually retains under its view. */
+const archiveReference =
+	(capture: RemoteToolOutputView): RemoteOutputIdResolver =>
+	toolCallId =>
+		capture.currentTools.some(tool => tool.toolCallId === toolCallId) ? toolCallId : undefined;
 
 export interface RemoteServerOptions {
 	/** Injectable clock (lease expiry, receipt retention); defaults to `Date.now`. */
@@ -86,6 +123,13 @@ export async function startRemoteRpcServer(
 	// disconnecting neither answers nor cancels them, and one request id can
 	// never consume another session's pending dialog.
 	const approvals = new Map<string, Map<string, Record<string, unknown>>>();
+	// Tool output belongs to the session, not to a socket: frames are recorded
+	// even while no peer is attached, and only a session identity change resets them.
+	const toolOutputs = new RemoteToolOutputs();
+	const views = new Map<string, SyncedView>();
+	// The newest full assistant snapshot only; the delta log that produced it is never kept.
+	let partialReply: { sessionId: string | null; messageId: string; message: unknown } | null = null;
+	let scopedSessionId: string | null | undefined;
 	let controller: ReadableStreamDefaultController<Uint8Array>;
 	let inputBytes = 0;
 	const inputQueue: InputEntry[] = [];
@@ -169,26 +213,33 @@ export async function startRemoteRpcServer(
 	const release = (peer: Peer) => {
 		if (lease?.peer === peer) lease = undefined;
 		peer.synced = false;
+		// The superseded sync's pages die with its lease; the next sync captures fresh ones.
+		if (peer.view !== undefined) {
+			views.delete(peer.view);
+			peer.view = undefined;
+		}
 	};
 	const currentLease = (peer: Peer, number: number): boolean => {
 		if (lease && lease.expires <= now()) release(lease.peer);
 		return lease?.peer === peer && lease.number === number;
 	};
-	const send = (peer: Peer, frame: object): void => {
+	const sendBytes = (peer: Peer, bytes: Uint8Array): void => {
 		if (peer.socket.destroyed) return;
+		if (
+			peer.queuedFrames >= REMOTE_MAX_QUEUE_FRAMES ||
+			peer.socket.writableLength + bytes.byteLength > REMOTE_MAX_QUEUE_BYTES
+		) {
+			peer.socket.destroy();
+			return;
+		}
+		peer.queuedFrames++;
+		peer.socket.write(bytes, () => {
+			peer.queuedFrames--;
+		});
+	};
+	const send = (peer: Peer, frame: object): void => {
 		try {
-			const bytes = encodeRemoteFrame(frame, peer.limit);
-			if (
-				peer.queuedFrames >= REMOTE_MAX_QUEUE_FRAMES ||
-				peer.socket.writableLength + bytes.byteLength > REMOTE_MAX_QUEUE_BYTES
-			) {
-				peer.socket.destroy();
-				return;
-			}
-			peer.queuedFrames++;
-			peer.socket.write(bytes, () => {
-				peer.queuedFrames--;
-			});
+			sendBytes(peer, encodeRemoteFrame(frame, peer.limit));
 		} catch {
 			peer.socket.destroy();
 		}
@@ -196,6 +247,21 @@ export async function startRemoteRpcServer(
 	const fail = (peer: Peer, id: string, code: RemoteErrorCode) =>
 		send(peer, { type: "reply", id, ok: false, error: { code } });
 	const reply = (peer: Peer, id: string, data: unknown) => send(peer, { type: "reply", id, ok: true, data });
+	/** A page never kills its connection: what cannot encode at the negotiated limit answers `overflow`. */
+	const replyCapped = (peer: Peer, id: string, data: unknown): void => {
+		try {
+			sendBytes(peer, encodeRemoteFrame({ type: "reply", id, ok: true, data }, peer.limit));
+		} catch {
+			fail(peer, id, "overflow");
+		}
+	};
+	/** A view reads only for its owning peer, on the live lease number and session it captured. */
+	const validView = (peer: Peer, viewId: string): SyncedView | undefined => {
+		const view = views.get(viewId);
+		if (!view || view.owner !== peer) return undefined;
+		if (!lease || lease.peer !== peer || lease.number !== view.lease || lease.expires <= now()) return undefined;
+		return view.sessionId === (session.sessionManager.getSessionId() ?? null) ? view : undefined;
+	};
 	const publishReceipt = (scope: RemoteActionScope, receipt: RemoteReceipt): void => {
 		sequence++;
 		for (const peer of peers)
@@ -278,7 +344,8 @@ export async function startRemoteRpcServer(
 				reply(peer, id, {});
 				return;
 			case "sync": {
-				if (!currentLease(peer, request.data.lease)) {
+				const leaseNumber = request.data.lease;
+				if (!currentLease(peer, leaseNumber)) {
 					fail(peer, id, "stale_lease");
 					return;
 				}
@@ -289,12 +356,29 @@ export async function startRemoteRpcServer(
 					fail(peer, id, "unsupported");
 					return;
 				}
+				// One synchronous capture: watermark, transcript view, tool-output
+				// capture and partial reply are read in the same event-loop turn, so
+				// every delta sent after this reply carries a strictly greater `seq`.
+				const capture = toolOutputs.capture();
+				const view: SyncedView = {
+					id: capture.view,
+					owner: peer,
+					lease: leaseNumber,
+					sessionId,
+					seq: sequence,
+					history: new RemoteHistoryView(capture.view, session.messages),
+					outputs: capture,
+				};
+				if (peer.view !== undefined) views.delete(peer.view);
+				peer.view = view.id;
+				views.set(view.id, view);
 				peer.synced = true;
 				const pendingForSession = sessionId ? [...(approvals.get(sessionId)?.values() ?? [])] : [];
-				reply(peer, id, {
+				const partial = partialReply?.sessionId === sessionId ? partialReply : undefined;
+				replyCapped(peer, id, {
 					epoch: registration.epoch,
-					seq: sequence,
-					view: randomUUID(),
+					seq: view.seq,
+					view: view.id,
 					sessionId,
 					cwd: workspace,
 					phase: !ready
@@ -307,11 +391,54 @@ export async function startRemoteRpcServer(
 									? "running"
 									: "idle",
 					runId,
-					partialReply: null,
-					currentTools: [],
+					// The newest full assistant message, bounded if it outgrew a frame —
+					// never the token deltas that produced it.
+					partialReply: partial
+						? { messageId: partial.messageId, message: boundedHistoryItem(partial.message, pageBudget(peer)) }
+						: null,
+					currentTools: capture.currentTools,
 					pendingApprovals: pendingForSession,
 					historyCursor: null,
 				});
+				return;
+			}
+			case "history": {
+				const view = validView(peer, request.data.view);
+				if (!view) {
+					fail(peer, id, "stale_session");
+					return;
+				}
+				const page = view.history.page(request.data.cursor, pageBudget(peer), archiveReference(view.outputs));
+				if (!page) {
+					fail(peer, id, "invalid_request");
+					return;
+				}
+				replyCapped(peer, id, { view: view.id, items: page.items, cursor: page.cursor });
+				return;
+			}
+			case "output": {
+				const view = validView(peer, request.data.view);
+				if (!view) {
+					fail(peer, id, "stale_session");
+					return;
+				}
+				// Paging runs off the capture taken at this sync: growth, eviction
+				// and `clear` afterwards cannot change what the view serves.
+				const budget = pageBudget(peer);
+				const { outputId, cursor } = request.data;
+				const page = outputId.startsWith("history.")
+					? view.history.output(outputId, cursor, budget)
+					: view.outputs.page(
+							view.id,
+							outputId,
+							cursor,
+							Math.max(4, Math.min(budget, Math.floor((peer.limit - 1024) / 6))),
+						);
+				if (!page) {
+					fail(peer, id, "invalid_request");
+					return;
+				}
+				replyCapped(peer, id, page);
 				return;
 			}
 			case "sessions": {
@@ -571,9 +698,33 @@ export async function startRemoteRpcServer(
 	function output(frame: object): void {
 		if (closed) return;
 		const value = frame as Record<string, unknown>;
+		const sessionId = session.sessionManager.getSessionId() ?? null;
+		if (sessionId !== scopedSessionId) {
+			// A session identity change — never a peer disconnect — retires the
+			// captured transcript state and every view that could read it.
+			scopedSessionId = sessionId;
+			toolOutputs.clear();
+			partialReply = null;
+			for (const [viewId, view] of views) if (view.sessionId !== sessionId) views.delete(viewId);
+		}
+		let forward: object = frame;
+		// The archive belongs to the session independently of attachments.
+		toolOutputs.observe(value);
+		if (value.type === "command_output" && typeof value.text === "string") {
+			const outputId = `command.${sequence + 1}`;
+			toolOutputs.observe({
+				type: "tool_execution_end",
+				toolCallId: outputId,
+				toolName: "command_output",
+				result: value.text,
+			});
+			forward = { ...value, outputId };
+		}
 		if (value.type === "ready") {
 			ready = true;
-			return;
+			// Ordered ready marker for the GUI reducer: it claims this sequence
+			// slot, so a synced client applies it before any later delta.
+			forward = { type: "remote_ready" };
 		}
 		if (value.type === "response" && typeof value.id === "string") {
 			const waiting = pending.get(value.id);
@@ -613,7 +764,6 @@ export async function startRemoteRpcServer(
 				typeof value.method === "string" &&
 				REMOTE_UI_METHODS.includes(value.method)
 			) {
-				const sessionId = session.sessionManager.getSessionId();
 				if (sessionId) {
 					let dialogs = approvals.get(sessionId);
 					if (!dialogs) {
@@ -624,19 +774,45 @@ export async function startRemoteRpcServer(
 				}
 			}
 		}
+		if (value.type === "message_start" || value.type === "message_update") {
+			const message = value.message as Record<string, unknown> | undefined;
+			if (message?.role === "assistant" && typeof value.messageId === "string")
+				partialReply = { sessionId, messageId: value.messageId, message };
+		} else if (value.type === "message_end" && partialReply?.messageId === value.messageId) {
+			partialReply = null;
+		}
 		if (value.type === "agent_start") {
 			runId = randomUUID();
 			// The run materialized: admitted prompts no longer race session switches.
 			unresolvedPrompts = 0;
+			// The GUI binds its reducer slot to the run this event opened.
+			forward = { ...value, runId };
 		} else if (value.type === "agent_end") {
+			const endedRunId = runId;
 			runId = null;
+			if (partialReply?.sessionId === sessionId) partialReply = null;
+			// The id of the run that just ended, not the (absent) current one.
+			forward = { type: "agent_end", runId: endedRunId, isTerminal: value.isTerminal };
 		}
-		const sessionId = session.sessionManager.getSessionId();
 		if (!sessionId) return;
 		sequence++;
-		for (const peer of peers)
-			if (peer.synced && lease?.peer === peer && currentLease(peer, lease.number))
-				send(peer, { type: "event", epoch: registration.epoch, seq: sequence, sessionId, event: frame });
+		for (const peer of peers) {
+			if (!peer.synced || lease?.peer !== peer || !currentLease(peer, lease.number)) continue;
+			const envelope = { type: "event", epoch: registration.epoch, seq: sequence, sessionId };
+			try {
+				sendBytes(peer, encodeRemoteFrame({ ...envelope, event: forward }, peer.limit));
+			} catch {
+				const view = peer.view === undefined ? undefined : views.get(peer.view);
+				send(peer, {
+					...envelope,
+					event: boundedRemoteEvent(
+						forward,
+						Math.max(512, peer.limit - 512),
+						view && archiveReference(view.outputs),
+					),
+				});
+			}
+		}
 	}
 	return { input, output, close, mayAbort };
 }

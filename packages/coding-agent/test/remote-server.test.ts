@@ -101,7 +101,7 @@ async function decode(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<
 
 interface Fixture {
 	server: RemoteRpcInstance;
-	state: { sessionId: string | null };
+	state: { sessionId: string | null; messages: Record<string, unknown>[] };
 	reader: ReadableStreamDefaultReader<Uint8Array>;
 	hello: object;
 	epoch: () => string;
@@ -115,10 +115,11 @@ async function serve(remote?: RemoteServerOptions): Promise<Fixture> {
 	const workspace = await fs.realpath(directory);
 	const name = `test-${randomUUID()}`;
 	let time = 1_000_000;
-	const state = { sessionId: "session-1" };
+	const state = { sessionId: "session-1", messages: [] as Record<string, unknown>[] };
 	const session = {
 		sessionManager: { getCwd: () => workspace, getSessionId: () => state.sessionId },
 		isRunActive: false,
+		messages: state.messages,
 	} as unknown as AgentSession;
 	const server = await startRemoteRpcServer(name, session, { now: () => time, ...remote });
 	cleanup.push(() => server.close());
@@ -589,6 +590,7 @@ describe("remote RPC instance", () => {
 		const session = {
 			sessionManager: { getCwd: () => workspace, getSessionId: () => "session-1" },
 			isRunActive: false,
+			messages: [],
 		} as unknown as AgentSession;
 		const previousListeners = new Set(process.rawListeners(signal));
 		const server = await startRemoteRpcServer(`test-${randomUUID()}`, session);
@@ -623,5 +625,301 @@ describe("remote RPC instance", () => {
 		).toEqual({ code: "busy" });
 		first.socket.destroy();
 		second.socket.destroy();
+	});
+
+	test("sync captures one view: history pages the captured transcript while live events number past the watermark", async () => {
+		const fixture = await serve();
+		fixture.server.output({ type: "ready" });
+		const captured: Record<string, unknown>[] = Array.from({ length: 200 }, (_, index) => ({
+			role: "user",
+			content: `m${index}`,
+		}));
+		// A single tool result larger than any servable page.
+		captured[5] = {
+			role: "toolResult",
+			toolCallId: "t-huge",
+			toolName: "bash",
+			isError: false,
+			timestamp: 1,
+			content: [{ type: "text", text: "x".repeat(400_000) }],
+		};
+		fixture.state.messages.push(...captured);
+		const client = await attach(fixture, 1);
+		const snapshot = (await client.ask("sync-1", { type: "request", id: "sync-1", op: "sync", data: { lease: 1 } }))
+			.data as { view: string; seq: number; historyCursor: unknown; partialReply: unknown; currentTools: unknown[] };
+		expect(typeof snapshot.view).toBe("string");
+		expect(snapshot.historyCursor).toBeNull();
+		expect(snapshot.partialReply).toBeNull();
+		expect(snapshot.currentTools).toEqual([]);
+
+		// A live delta issued after the reply is numbered past the watermark.
+		fixture.server.output({ type: "text_delta", delta: "later" });
+		expect(await client.next()).toMatchObject({
+			type: "event",
+			seq: snapshot.seq + 1,
+			event: { type: "text_delta" },
+		});
+
+		// The captured transcript pages through with opaque cursors: more than one
+		// page, chained to the end, with the giant tool result as an explicit
+		// truncated fragment (no archive record exists, so no output reference).
+		const view = snapshot.view;
+		const pages: { asked: string | undefined; items: Record<string, unknown>[]; next: string | undefined }[] = [];
+		for (;;) {
+			const asked = pages.length === 0 ? undefined : pages[pages.length - 1]!.next;
+			const data = (
+				await client.ask(`history-${pages.length}`, {
+					type: "request",
+					id: `history-${pages.length}`,
+					op: "history",
+					data: asked === undefined ? { view } : { view, cursor: asked },
+				})
+			).data as { items: Record<string, unknown>[]; cursor: string | null };
+			expect(data.items.length).toBeGreaterThan(0);
+			pages.push({ asked, items: data.items, next: data.cursor ?? undefined });
+			if (data.cursor === null) break;
+		}
+		expect(pages.length).toBeGreaterThan(1);
+		const flat = pages.flatMap(page => page.items);
+		expect(flat).toHaveLength(200);
+		const huge = flat[5];
+		expect(huge).toMatchObject({ role: "toolResult", toolCallId: "t-huge", truncated: true });
+		expect(typeof huge.preview === "string" && huge.preview.length > 0).toBe(true);
+		expect(huge.outputId).toBe("history.5");
+		const collected: string[] = [];
+		let outputCursor: string | null = null;
+		do {
+			const requestId = `persisted-output-${collected.length}`;
+			const page = (
+				await client.ask(requestId, {
+					type: "request",
+					id: requestId,
+					op: "output",
+					data: { view, outputId: huge.outputId, ...(outputCursor ? { cursor: outputCursor } : {}) },
+				})
+			).data as { data: string; cursor: string | null; truncated: boolean };
+			expect(page.truncated).toBe(false);
+			expect(page.data.length).toBeGreaterThan(0);
+			collected.push(page.data);
+			outputCursor = page.cursor;
+		} while (outputCursor && collected.length < 10);
+		expect(collected.join("")).toBe("x".repeat(400_000));
+		for (const [index, item] of flat.entries()) if (index !== 5) expect(item).toEqual(captured[index]);
+
+		// Appends to the live transcript never shift a captured page.
+		const midCursor = pages[0]!.next;
+		expect(typeof midCursor).toBe("string");
+		const before = (
+			await client.ask("history-mid", {
+				type: "request",
+				id: "history-mid",
+				op: "history",
+				data: { view, cursor: midCursor },
+			})
+		).data;
+		fixture.state.messages.push({ role: "user", content: "late-append" });
+		expect(
+			(
+				await client.ask("history-mid-2", {
+					type: "request",
+					id: "history-mid-2",
+					op: "history",
+					data: { view, cursor: midCursor },
+				})
+			).data,
+		).toEqual(before);
+
+		// A second sync supersedes the view; the old id is refused on both page ops.
+		const resync = (await client.ask("sync-2", { type: "request", id: "sync-2", op: "sync", data: { lease: 1 } }))
+			.data as Record<string, unknown>;
+		expect(resync.view).not.toBe(view);
+		expect(
+			(await client.ask("history-old", { type: "request", id: "history-old", op: "history", data: { view } })).error,
+		).toEqual({ code: "stale_session" });
+		expect(
+			(
+				await client.ask("output-old", {
+					type: "request",
+					id: "output-old",
+					op: "output",
+					data: { view, outputId: "t-huge" },
+				})
+			).error,
+		).toEqual({ code: "stale_session" });
+		client.socket.destroy();
+	});
+
+	test("output recorded while detached stays pageable; partial reply rides the snapshot; session change retires the view", async () => {
+		const fixture = await serve();
+		fixture.server.output({ type: "ready" });
+		// No client has ever attached: the instance still records the live output.
+		fixture.server.output({
+			type: "tool_execution_start",
+			toolCallId: "tool-1",
+			toolName: "bash",
+			args: { command: "make" },
+		});
+		fixture.server.output({
+			type: "tool_execution_update",
+			toolCallId: "tool-1",
+			toolName: "bash",
+			partialResult: "built-while-detached",
+		});
+		fixture.server.output({
+			type: "tool_execution_end",
+			toolCallId: "tool-1",
+			toolName: "bash",
+			result: "built-while-detached",
+			isError: false,
+		});
+
+		const client = await attach(fixture, 1);
+		const snap1 = (await client.ask("sync-1", { type: "request", id: "sync-1", op: "sync", data: { lease: 1 } }))
+			.data as { view: string; currentTools: { toolCallId: string; outputId: string }[] };
+		// The result finished without a client and is addressable from the snapshot.
+		expect(snap1.currentTools).toMatchObject([{ toolCallId: "tool-1", toolName: "bash", done: true }]);
+		const outputId = snap1.currentTools[0]!.outputId;
+		const page = (
+			await client.ask("output-1", {
+				type: "request",
+				id: "output-1",
+				op: "output",
+				data: { view: snap1.view, outputId },
+			})
+		).data as Record<string, unknown>;
+		expect(page).toMatchObject({ view: snap1.view, outputId, data: "built-while-detached", truncated: false });
+		expect(page.cursor).toBeNull();
+
+		// The partial reply carries the newest full assistant message only.
+		fixture.server.output({ type: "message_start", messageId: "m1", message: { role: "assistant", content: [] } });
+		fixture.server.output({
+			type: "message_update",
+			messageId: "m1",
+			message: { role: "assistant", content: [{ type: "text", text: "half-written" }] },
+		});
+		const snap2 = (await client.ask("sync-2", { type: "request", id: "sync-2", op: "sync", data: { lease: 1 } }))
+			.data as Record<string, unknown>;
+		expect(snap2.partialReply).toEqual({
+			messageId: "m1",
+			message: { role: "assistant", content: [{ type: "text", text: "half-written" }] },
+		});
+		// The superseded view dies the moment its sync is replaced.
+		expect(
+			(
+				await client.ask("history-stale", {
+					type: "request",
+					id: "history-stale",
+					op: "history",
+					data: { view: snap1.view },
+				})
+			).error,
+		).toEqual({ code: "stale_session" });
+
+		// A finished message leaves no partial behind.
+		fixture.server.output({
+			type: "message_end",
+			messageId: "m1",
+			message: { role: "assistant", content: [{ type: "text", text: "half-written" }] },
+		});
+		const snap3 = (await client.ask("sync-3", { type: "request", id: "sync-3", op: "sync", data: { lease: 1 } }))
+			.data as Record<string, unknown>;
+		expect(snap3.partialReply).toBeNull();
+
+		// A session identity change resets the archive and retires old-session views.
+		fixture.state.sessionId = "session-2";
+		fixture.server.output({ type: "turn_start" });
+		const snap4 = (await client.ask("sync-4", { type: "request", id: "sync-4", op: "sync", data: { lease: 1 } }))
+			.data as Record<string, unknown>;
+		expect(snap4.sessionId).toBe("session-2");
+		expect(snap4.currentTools).toEqual([]);
+		expect(
+			(
+				await client.ask("history-old-session", {
+					type: "request",
+					id: "history-old-session",
+					op: "history",
+					data: { view: snap3.view },
+				})
+			).error,
+		).toEqual({ code: "stale_session" });
+		// The fresh view is live but reads only the new session's (empty) archive.
+		expect(
+			(
+				await client.ask("output-old-session", {
+					type: "request",
+					id: "output-old-session",
+					op: "output",
+					data: { view: snap4.view, outputId },
+				})
+			).error,
+		).toEqual({ code: "invalid_request" });
+		client.socket.destroy();
+	});
+
+	test("ready lands in order; oversized live frames degrade to explicit previews; agent events carry the run", async () => {
+		const fixture = await serve();
+		const client = await attach(fixture, 1);
+		const snapshot = (await client.ask("sync-1", { type: "request", id: "sync-1", op: "sync", data: { lease: 1 } }))
+			.data as { seq: number };
+
+		// The ready marker takes a sequence slot ahead of later deltas.
+		fixture.server.output({ type: "ready" });
+		fixture.server.output({ type: "text_delta", delta: "after-ready" });
+		expect(await client.next()).toMatchObject({
+			type: "event",
+			seq: snapshot.seq + 1,
+			event: { type: "remote_ready" },
+		});
+		expect(await client.next()).toMatchObject({
+			type: "event",
+			seq: snapshot.seq + 2,
+			event: { type: "text_delta" },
+		});
+
+		// A frame larger than the negotiated limit cannot evict the attach: the
+		// client receives an explicit truncated preview and stays connected.
+		fixture.server.output({
+			type: "message_end",
+			messageId: "m-big",
+			message: { role: "assistant", content: [{ type: "text", text: "y".repeat(2 * 1024 * 1024) }] },
+		});
+		const big = await client.next();
+		const preview = big.event as Record<string, unknown>;
+		expect(preview).toMatchObject({ type: "message_end", messageId: "m-big", truncated: true });
+		expect(typeof preview.preview === "string" && preview.preview.length > 0).toBe(true);
+		expect(client.socket.destroyed).toBe(false);
+
+		// Runs are named on the events so the GUI can bind state to the right one.
+		fixture.server.output({ type: "agent_start" });
+		const started = await client.next();
+		const startedEvent = started.event as { type: string; runId: string };
+		expect(startedEvent.type).toBe("agent_start");
+		const runId = startedEvent.runId;
+		expect(runId).toBeTruthy();
+		fixture.server.output({ type: "agent_end", messages: [] });
+		expect(await client.next()).toMatchObject({ type: "event", event: { type: "agent_end", runId } });
+		const after = (await client.ask("sync-2", { type: "request", id: "sync-2", op: "sync", data: { lease: 1 } }))
+			.data as Record<string, unknown>;
+		expect(after).toMatchObject({ phase: "idle", runId: null });
+		client.socket.destroy();
+	});
+
+	test("a stalled reader overruns its queue without dropping the instance or its run", async () => {
+		const fixture = await serve();
+		fixture.server.output({ type: "ready" });
+		const slow = await attach(fixture, 1);
+		await slow.ask("slow-sync", { type: "request", id: "slow-sync", op: "sync", data: { lease: 1 } });
+		const closed = once(slow.socket, "close");
+		slow.socket.pause();
+		fixture.server.output({ type: "agent_start" });
+		const text = "x".repeat(512 * 1024);
+		for (let index = 0; index < 40; index++) fixture.server.output({ type: "text_delta", text });
+		slow.socket.resume();
+		await closed;
+		const next = await attach(fixture, 2);
+		expect(
+			(await next.ask("next-sync", { type: "request", id: "next-sync", op: "sync", data: { lease: 2 } })).data,
+		).toMatchObject({ phase: "running", epoch: fixture.epoch(), sessionId: "session-1" });
+		next.socket.destroy();
 	});
 });
