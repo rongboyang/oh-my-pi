@@ -16,6 +16,7 @@ import { RemoteToolOutputs, type RemoteToolOutputView } from "./remote-tool-outp
 import {
 	encodeRemoteFrame,
 	parseRemoteClientFrame,
+	parseRemoteModel,
 	RemoteFrameDecoder,
 	REMOTE_LEASE_TIMEOUT_MS,
 	REMOTE_MAX_FRAME_BYTES,
@@ -38,6 +39,7 @@ interface Peer {
 	limit: number;
 	hello: boolean;
 	documents?: boolean;
+	models?: boolean;
 	synced: boolean;
 	queuedFrames: number;
 	/** Id of the latest synchronous capture this peer may page with. */
@@ -47,7 +49,7 @@ interface Peer {
 /** One dispatched action awaiting Core's reply; the receipt, not a peer, owns it. */
 interface PendingAction {
 	readonly scope: RemoteActionScope;
-	readonly kind: "prompt" | "stop" | "session";
+	readonly kind: "prompt" | "stop" | "session" | "model";
 	/** For stops: the run this abort may stop. Core's reply settles the receipt. */
 	readonly runId?: string;
 }
@@ -88,6 +90,11 @@ const archiveReference =
 	toolCallId =>
 		capture.currentTools.some(tool => tool.toolCallId === toolCallId) ? toolCallId : undefined;
 
+/** Project only display identity: Core model objects may carry transport headers. */
+function publicModel(model: AgentSession["model"]) {
+	return model ? parseRemoteModel({ provider: model.provider, id: model.id, name: model.name }) : null;
+}
+
 export interface RemoteServerOptions {
 	/** Injectable clock (lease expiry, receipt retention); defaults to `Date.now`. */
 	now?: () => number;
@@ -117,7 +124,8 @@ export async function startRemoteRpcServer(
 	const { registration } = owner;
 	const { workspace } = registration;
 	const documents = openRemoteDocumentWorkspace(workspace);
-	if (documents) registration.capabilities = [...REMOTE_REQUIRED_CAPABILITIES, "read_document"];
+	registration.capabilities = [...REMOTE_REQUIRED_CAPABILITIES, "select_model"];
+	if (documents) registration.capabilities = [...registration.capabilities, "read_document"];
 	const now = options.now ?? Date.now;
 	const ledger = new RemoteReceiptLedger({ now });
 	const catalog = options.sessions ?? createWorkspaceSessionCatalog(workspace);
@@ -169,7 +177,12 @@ export async function startRemoteRpcServer(
 	/** A gated frame delivers only while its precondition still holds at the moment Core asks for it. */
 	const isCurrent = (entry: InputEntry): boolean => {
 		if (entry.kind === "stop") return entry.abortRunId !== undefined && entry.abortRunId === runId;
-		if (entry.kind === "session") return runId === null && unresolvedPrompts === 0;
+		if (entry.kind === "session")
+			return (
+				entry.scope?.sessionId === session.sessionManager.getSessionId() &&
+				runId === null &&
+				unresolvedPrompts === 0
+			);
 		return true;
 	};
 	/** The window passed before Core read the frame: settle the receipt, deliver nothing. */
@@ -179,7 +192,9 @@ export async function startRemoteRpcServer(
 			// The stop must never reach a later run; the target already changed.
 			if (entry.scope) settle(entry.scope, { status: "rejected", error: { code: "stale_run" } });
 		} else if (entry.scope) {
-			settle(entry.scope, { status: "rejected", error: { code: "invalid_request" } });
+			const code =
+				entry.scope.sessionId === session.sessionManager.getSessionId() ? "invalid_request" : "stale_session";
+			settle(entry.scope, { status: "rejected", error: { code } });
 		}
 	};
 	const deliverOne = (value: ReadableStreamDefaultController<Uint8Array>): boolean => {
@@ -310,12 +325,13 @@ export async function startRemoteRpcServer(
 			peer.limit = Math.min(frame.maxFrameBytes, REMOTE_MAX_FRAME_BYTES);
 			peer.hello = true;
 			peer.documents = documents !== null && frame.capabilities.includes("read_document");
+			peer.models = frame.capabilities.includes("select_model");
 			reply(peer, frame.id, {
 				version: REMOTE_PROTOCOL_VERSION,
 				instanceKey: registration.instanceKey,
 				workspace,
 				epoch: registration.epoch,
-				capabilities: peer.documents ? registration.capabilities : REMOTE_REQUIRED_CAPABILITIES,
+				capabilities: registration.capabilities.filter(capability => frame.capabilities.includes(capability)),
 				maxFrameBytes: peer.limit,
 			});
 			peer.decoder = new RemoteFrameDecoder(peer.limit);
@@ -446,6 +462,21 @@ export async function startRemoteRpcServer(
 				replyCapped(peer, id, page);
 				return;
 			}
+			case "models": {
+				if (!peer.models) {
+					fail(peer, id, "unsupported");
+					return;
+				}
+				if (!ready || !validView(peer, request.data.view)) {
+					fail(peer, id, "stale_session");
+					return;
+				}
+				replyCapped(peer, id, {
+					current: publicModel(session.model),
+					models: session.getAvailableModels().flatMap(model => publicModel(model) ?? []),
+				});
+				return;
+			}
 			case "read_document": {
 				if (!peer.documents || !documents) {
 					fail(peer, id, "unsupported");
@@ -500,6 +531,10 @@ export async function startRemoteRpcServer(
 					actionId: action.actionId,
 				};
 				const command = action.command;
+				if (command.type === "set_model" && !peer.models) {
+					fail(peer, id, "unsupported");
+					return;
+				}
 				// Register before dispatch so a lost reply cannot turn a retry into a second
 				// side effect. The register is scoped to the ORIGINAL session: after a switch
 				// the active id differs, but repeating the action must still return the same
@@ -603,6 +638,15 @@ export async function startRemoteRpcServer(
 					inner = targetPath
 						? { id: innerId, type: "switch_session", sessionPath: targetPath }
 						: { id: innerId, type: "new_session" };
+				} else if (command.type === "set_model") {
+					if (runId !== null || unresolvedPrompts > 0) {
+						settle(scope, { status: "rejected", error: { code: "busy" } });
+						fail(peer, id, "busy");
+						return;
+					}
+					pending.set(innerId, { scope, kind: "model" });
+					gate = { kind: "session", scope, innerId };
+					inner = { id: innerId, ...command };
 				} else {
 					pending.set(innerId, { scope, kind: "prompt" });
 					unresolvedPrompts++;
@@ -755,7 +799,7 @@ export async function startRemoteRpcServer(
 				settle(
 					waiting.scope,
 					value.success
-						? { status: "succeeded", data: value.data ?? null }
+						? { status: "succeeded", data: waiting.kind === "model" ? null : (value.data ?? null) }
 						: {
 								status: "rejected",
 								// Core state refusals (busy, kind mismatch) were not executed;

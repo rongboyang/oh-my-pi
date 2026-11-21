@@ -99,6 +99,11 @@ async function decode(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<
 	return JSON.parse(new TextDecoder().decode(frame.value)) as Record<string, unknown>;
 }
 
+const selectableModels = [
+	{ provider: "custom", id: "alpha", name: "Alpha", headers: { Authorization: "test-only-private" } },
+	{ provider: "custom", id: "beta", name: "Beta", baseUrl: "http://private-url.test" },
+];
+
 interface Fixture {
 	server: RemoteRpcInstance;
 	state: { sessionId: string | null; messages: Record<string, unknown>[] };
@@ -107,6 +112,7 @@ interface Fixture {
 	epoch: () => string;
 	socketPath: string;
 	advance: (ms: number) => void;
+	setModel(index: number): void;
 }
 
 async function serve(remote?: RemoteServerOptions): Promise<Fixture> {
@@ -116,10 +122,15 @@ async function serve(remote?: RemoteServerOptions): Promise<Fixture> {
 	const name = `test-${randomUUID()}`;
 	let time = 1_000_000;
 	const state = { sessionId: "session-1", messages: [] as Record<string, unknown>[] };
+	let model = selectableModels[0];
 	const session = {
 		sessionManager: { getCwd: () => workspace, getSessionId: () => state.sessionId },
 		isRunActive: false,
 		messages: state.messages,
+		get model() {
+			return model;
+		},
+		getAvailableModels: () => selectableModels,
 	} as unknown as AgentSession;
 	const server = await startRemoteRpcServer(name, session, { now: () => time, ...remote });
 	cleanup.push(() => server.close());
@@ -143,6 +154,9 @@ async function serve(remote?: RemoteServerOptions): Promise<Fixture> {
 		},
 		epoch: () => record.epoch,
 		socketPath: record.socketPath,
+		setModel: index => {
+			model = selectableModels[index];
+		},
 		advance: ms => {
 			time += ms;
 		},
@@ -921,6 +935,48 @@ describe("remote RPC instance", () => {
 			(await next.ask("next-sync", { type: "request", id: "next-sync", op: "sync", data: { lease: 2 } })).data,
 		).toMatchObject({ phase: "running", epoch: fixture.epoch(), sessionId: "session-1" });
 		next.socket.destroy();
+	});
+
+	test("model selection is negotiated, view-scoped, and never exposes provider transport metadata", async () => {
+		const fixture = await serve();
+		fixture.server.output({ type: "ready" });
+		const client = await connect(fixture.socketPath);
+		const request = (id: string, op: string, data: object) => ({ type: "request", id, op, data });
+		const hello = await client.ask("model-hello", {
+			...fixture.hello,
+			id: "model-hello",
+			capabilities: [...REMOTE_REQUIRED_CAPABILITIES, "select_model"],
+		});
+		expect(hello.data).toMatchObject({ capabilities: [...REMOTE_REQUIRED_CAPABILITIES, "select_model"] });
+		expect((await client.ask("no-view", request("no-view", "models", { view: "old" }))).error).toEqual({
+			code: "stale_session",
+		});
+		await client.ask("lease", request("lease", "acquire", {}));
+		const sync = await client.ask("sync", request("sync", "sync", { lease: 1 }));
+		const { view } = sync.data as { view: string };
+		const models = await client.ask("models", request("models", "models", { view }));
+		const alpha = { provider: "custom", id: "alpha", name: "Alpha" };
+		const beta = { provider: "custom", id: "beta", name: "Beta" };
+		expect(models.data).toEqual({ current: alpha, models: [alpha, beta] });
+
+		const command = { type: "set_model", provider: "custom", modelId: "beta" };
+		const accepted = await client.ask("set", action("set", fixture, 1, "pick", command));
+		expect(accepted.data).toEqual({ status: "accepted" });
+		const inner = await decode(fixture.reader);
+		expect(inner).toEqual({ ...command, id: expect.any(String) });
+		fixture.setModel(1);
+		fixture.server.output({ type: "response", id: inner.id, success: true, data: selectableModels[1] });
+		expect((await client.ask("receipt", receiptQuery("receipt", fixture, "pick"))).data).toEqual({
+			status: "succeeded",
+			data: null,
+		});
+		expect((await client.ask("updated", request("updated", "models", { view }))).data).toEqual({
+			current: beta,
+			models: [alpha, beta],
+		});
+		fixture.server.output({ type: "agent_start" });
+		expect((await client.ask("busy", action("busy", fixture, 1, "busy", command))).error).toEqual({ code: "busy" });
+		client.socket.destroy();
 	});
 
 	test.skipIf(process.platform !== "darwin")(
